@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+#include "myinit.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,9 +14,12 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <pthread.h>
-
-#define TARGET_PROGRAM "/init"
-#define LOG_PREFIX "myinit: "
+#include <signal.h>
+#include <pty.h>
+#include <utmp.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
 
 #ifdef DEBUG
 #define DEBUG_PRINT(fmt, ...) do { \
@@ -25,14 +30,14 @@
 #define DEBUG_PRINT(fmt, ...)
 #endif
 
-// Функция для обработки клиентского подключения
+// Handle a single client connection.
 void *handle_client(void *arg) {
     int client_fd = *(int *)arg;
     free(arg);
 
     DEBUG_PRINT("Received new client connection\n");
 
-    // Читаем команду из сокета (формат: PID<SOH>command<SOH>cwd)
+    // Read the request from the socket (format: PID<SOH>command<SOH>cwd).
     char buffer[1024];
     ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
     if (bytes_read <= 0) {
@@ -43,7 +48,7 @@ void *handle_client(void *arg) {
     buffer[bytes_read] = '\0';
     DEBUG_PRINT("Received message (%zd bytes): '%s'\n", bytes_read, buffer);
 
-    // Парсим PID, команду и текущий каталог, используя SOH (\001) как разделитель
+    // Parse PID, command and cwd using SOH (\001) as separator.
     char *pid_str = strtok(buffer, "\001");
     char *command = strtok(NULL, "\001");
     char *cwd = strtok(NULL, "");
@@ -55,7 +60,7 @@ void *handle_client(void *arg) {
     }
     DEBUG_PRINT("Parsed PID='%s', command='%s', cwd='%s'\n", pid_str, command, cwd);
 
-    // Преобразуем PID в число
+    // Convert PID to integer.
     pid_t client_pid = atoi(pid_str);
     if (client_pid <= 0) {
         fprintf(stderr, LOG_PREFIX "Invalid PID: %s\n", pid_str);
@@ -64,7 +69,7 @@ void *handle_client(void *arg) {
     }
     DEBUG_PRINT("Converted PID to %d\n", client_pid);
 
-    // Проверяем, существует ли процесс
+    // Verify that the process still exists.
     char proc_path[64];
     snprintf(proc_path, sizeof(proc_path), "/proc/%d", client_pid);
     if (access(proc_path, F_OK) != 0) {
@@ -73,7 +78,7 @@ void *handle_client(void *arg) {
         return NULL;
     }
 
-    // Открываем /proc/PID/fd/0, /proc/PID/fd/1, /proc/PID/fd/2
+    // Open /proc/PID/fd/0, /proc/PID/fd/1, /proc/PID/fd/2.
     char fd_path[64];
     int stdin_fd, stdout_fd, stderr_fd;
 
@@ -107,7 +112,7 @@ void *handle_client(void *arg) {
     }
     DEBUG_PRINT("Opened %s as fd %d\n", fd_path, stderr_fd);
 
-    // Устанавливаем текущий каталог
+    // Change working directory.
     if (chdir(cwd) < 0) {
         fprintf(stderr, LOG_PREFIX "Failed to change directory to %s: %s\n", cwd, strerror(errno));
         close(stdin_fd);
@@ -118,7 +123,7 @@ void *handle_client(void *arg) {
     }
     DEBUG_PRINT("Changed current directory to %s\n", cwd);
 
-    // Выполняем команду через fork и execle
+    // Execute the command via fork + execle.
     DEBUG_PRINT("Executing command: %s\n", command);
     pid_t pid = fork();
     if (pid < 0) {
@@ -129,61 +134,49 @@ void *handle_client(void *arg) {
         close(client_fd);
         return NULL;
     } else if (pid == 0) {
-        signal(SIGTERM, SIG_IGN);
-        signal(SIGINT, SIG_IGN);
-        signal(SIGPIPE, SIG_IGN);
-        signal(SIGHUP, SIG_IGN);
-        // Дочерний процесс: перенаправляем потоки и запускаем команду
+        // Child: restore default signal handlers so the command behaves normally.
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+
         if (dup2(stdin_fd, STDIN_FILENO) < 0) {
             fprintf(stderr, LOG_PREFIX "Failed to dup2 stdin: %s\n", strerror(errno));
-            close(stdin_fd);
-            close(stdout_fd);
-            close(stderr_fd);
-            close(client_fd);
             _exit(1);
         }
         DEBUG_PRINT("Redirected stdin to fd %d\n", stdin_fd);
 
         if (dup2(stdout_fd, STDOUT_FILENO) < 0) {
             fprintf(stderr, LOG_PREFIX "Failed to dup2 stdout: %s\n", strerror(errno));
-            close(stdin_fd);
-            close(stdout_fd);
-            close(stderr_fd);
-            close(client_fd);
             _exit(1);
         }
         DEBUG_PRINT("Redirected stdout to fd %d\n", stdout_fd);
 
         if (dup2(stderr_fd, STDERR_FILENO) < 0) {
             fprintf(stderr, LOG_PREFIX "Failed to dup2 stderr: %s\n", strerror(errno));
-            close(stdin_fd);
-            close(stdout_fd);
-            close(stderr_fd);
-            close(client_fd);
             _exit(1);
         }
         DEBUG_PRINT("Redirected stderr to fd %d\n", stderr_fd);
 
-        // Закрываем файловые дескрипторы
+        // Close the file descriptors after redirection.
         close(stdin_fd);
         close(stdout_fd);
         close(stderr_fd);
         DEBUG_PRINT("Closed file descriptors for client PID %d\n", client_pid);
 
-        // Запускаем команду через execle
+        // Run the command through execle.
         char *const envp[] = {"HOSTNAME=localhost", "TERM=dumb", NULL};
         execle("/system/bin/sh", "sh", "-c", command, NULL, envp);
-        // Если execle возвращает, произошла ошибка
+        // If execle returns, an error occurred.
         fprintf(stderr, LOG_PREFIX "execle() failed to invoke /system/bin/sh: %s\n", strerror(errno));
         _exit(127);
     } else {
-        // Родительский процесс: закрываем дескрипторы
+        // Parent: close the descriptors, wait for the command, then notify the client.
         close(stdin_fd);
         close(stdout_fd);
         close(stderr_fd);
         DEBUG_PRINT("Closed file descriptors for client PID %d in parent\n", client_pid);
 
-        // Ждём завершения команды
         int status;
         if (waitpid(pid, &status, 0) < 0) {
             fprintf(stderr, LOG_PREFIX "waitpid() failed: %s\n", strerror(errno));
@@ -193,7 +186,6 @@ void *handle_client(void *arg) {
             DEBUG_PRINT("Command terminated by signal %d\n", WTERMSIG(status));
         }
 
-        // Отправляем уведомление о завершении
         const char *done_msg = "DONE";
         if (write(client_fd, done_msg, strlen(done_msg)) < 0) {
             fprintf(stderr, LOG_PREFIX "Failed to send DONE to client: %s\n", strerror(errno));
@@ -201,7 +193,6 @@ void *handle_client(void *arg) {
             DEBUG_PRINT("Sent DONE to client\n");
         }
 
-        // Закрываем клиентский сокет
         close(client_fd);
         DEBUG_PRINT("Client connection closed\n");
     }
@@ -209,13 +200,12 @@ void *handle_client(void *arg) {
     return NULL;
 }
 
-// Функция для прослушивания команд через сокет
+// Listen for commands over MYINIT_SOCKET_PATH.
 void command_listener(void) {
-    const char *socket_path = "/dev/myinit_socket";
+    const char *socket_path = MYINIT_SOCKET_PATH;
     int server_fd;
     struct sockaddr_un addr;
 
-    // Создаём UNIX-сокет
     server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server_fd < 0) {
         fprintf(stderr, LOG_PREFIX "Failed to create socket: %s\n", strerror(errno));
@@ -223,16 +213,13 @@ void command_listener(void) {
     }
     DEBUG_PRINT("Created socket fd %d\n", server_fd);
 
-    // Настраиваем адрес сокета
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
-    // Удаляем существующий сокет, если он есть
     unlink(socket_path);
     DEBUG_PRINT("Removed existing socket at %s\n", socket_path);
 
-    // Привязываем сокет
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, LOG_PREFIX "Failed to bind socket %s: %s\n", socket_path, strerror(errno));
         close(server_fd);
@@ -240,7 +227,6 @@ void command_listener(void) {
     }
     DEBUG_PRINT("Bound socket to %s\n", socket_path);
 
-    // Устанавливаем права доступа
     if (chmod(socket_path, 0666) < 0) {
         fprintf(stderr, LOG_PREFIX "Failed to set permissions on %s: %s\n", socket_path, strerror(errno));
         unlink(socket_path);
@@ -249,7 +235,6 @@ void command_listener(void) {
     }
     DEBUG_PRINT("Set permissions 0666 on %s\n", socket_path);
 
-    // Слушаем подключения
     if (listen(server_fd, 10) < 0) {
         fprintf(stderr, LOG_PREFIX "Failed to listen on socket: %s\n", strerror(errno));
         unlink(socket_path);
@@ -258,7 +243,6 @@ void command_listener(void) {
     }
     DEBUG_PRINT("Listening on socket\n");
 
-    // Принимаем подключения
     while (1) {
         int *client_fd = malloc(sizeof(int));
         if (!client_fd) {
@@ -274,7 +258,6 @@ void command_listener(void) {
         }
         DEBUG_PRINT("Accepted client connection, fd %d\n", *client_fd);
 
-        // Создаём поток для обработки клиента
         pthread_t client_thread;
         if (pthread_create(&client_thread, NULL, handle_client, client_fd) != 0) {
             fprintf(stderr, LOG_PREFIX "Failed to create client thread: %s\n", strerror(errno));
@@ -283,35 +266,31 @@ void command_listener(void) {
             continue;
         }
 
-        // Отсоединяем поток
         pthread_detach(client_thread);
         DEBUG_PRINT("Detached client thread for fd %d\n", *client_fd);
     }
 
-    // Закрываем серверный сокет (недостижимо)
     close(server_fd);
     unlink(socket_path);
     DEBUG_PRINT("Closed server socket and unlinked %s\n", socket_path);
 }
 
-// Функция для запуска слушателя команд
-void start_command_listener() {
+// Start the command listener in a forked child.
+void start_command_listener(void) {
     pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, LOG_PREFIX "Failed to fork for command listener: %s\n", strerror(errno));
         return;
     } else if (pid == 0) {
-        // Дочерний процесс: запускаем слушатель команд
         DEBUG_PRINT("Started command listener in child process with PID %d\n", getpid());
         command_listener();
-        exit(0); // Не достигается, так как command_listener работает бесконечно
+        exit(0);
     } else {
-        // Родительский процесс: продолжаем выполнение
         DEBUG_PRINT("Forked command listener with PID %d\n", pid);
     }
 }
 
-// Функция проверки монтирования точки
+// Check whether a given mount point is already mounted.
 int check_mount(const char *mounts_file, const char *mount_point) {
     FILE *proc_mounts = fopen(mounts_file, "r");
     if (!proc_mounts) {
@@ -332,13 +311,18 @@ int check_mount(const char *mounts_file, const char *mount_point) {
     return mounted;
 }
 
+// Main init logic: start listener, wait for /data, run script, launch interactive shell.
 void handle_logic() {
-    // 15 секунд должно хватить для первоначлаьной инициализации 
+    // 15 seconds should be enough for the initial boot phase.
     sleep(15);
 
+#if START_COMMAND_LISTENER
     start_command_listener();
+#else
+    DEBUG_PRINT("Command listener disabled by START_COMMAND_LISTENER=0\n");
+#endif
 
-    // Проверяем монтирование /data
+    // Wait for /data to be mounted.
     DEBUG_PRINT("Waiting for /data mount\n");
     while (1) {
         sleep(1);
@@ -347,52 +331,154 @@ void handle_logic() {
         }
     }
 
-    DEBUG_PRINT("Starting /data/local/tmp/myscript-max.sh\n");
-    int script_ret = system("sh /data/local/tmp/myscript-max.sh");
+    DEBUG_PRINT("Starting %s\n", MYSCRIPT_PATH);
+    char script_cmd[512];
+    snprintf(script_cmd, sizeof(script_cmd), "sh %s", MYSCRIPT_PATH);
+    int script_ret = system(script_cmd);
     if (script_ret == -1) {
-        fprintf(stderr, LOG_PREFIX "Failed to execute /data/local/tmp/myscript-max.sh: %s\n", strerror(errno));
+        fprintf(stderr, LOG_PREFIX "Failed to execute %s: %s\n", MYSCRIPT_PATH, strerror(errno));
     } else {
-        fprintf(stderr, LOG_PREFIX "/data/local/tmp/myscript-max.sh completed with exit status %d\n", WEXITSTATUS(script_ret));
+        fprintf(stderr, LOG_PREFIX "%s completed with exit status %d\n", MYSCRIPT_PATH, WEXITSTATUS(script_ret));
     }
 
     DEBUG_PRINT("Starting interactive shell on console\n");
-    // Запускаем /system/bin/sh с новым окружением
-    char *const envp[] = {"HOSTNAME=localhost", NULL};
-    if (execle("/system/bin/sh", "sh", NULL, envp) < 0) {
-        fprintf(stderr, LOG_PREFIX "Failed to exec /system/bin/sh: %s\n", strerror(errno));
+
+    // Make sure stdin is a real terminal. If not, attach to /dev/console.
+    if (!isatty(STDIN_FILENO)) {
+        int cfd = open("/dev/console", O_RDWR);
+        if (cfd >= 0) {
+            dup2(cfd, STDIN_FILENO);
+            dup2(cfd, STDOUT_FILENO);
+            dup2(cfd, STDERR_FILENO);
+            if (cfd > STDERR_FILENO) close(cfd);
+            DEBUG_PRINT("Attached stdio to /dev/console\n");
+        } else {
+            fprintf(stderr, LOG_PREFIX "Cannot open /dev/console: %s\n", strerror(errno));
+        }
     }
+
+    // Get terminal window size, if possible.
+    struct winsize ws;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == -1) {
+        memset(&ws, 0, sizeof(ws));
+        ws.ws_row = 24;
+        ws.ws_col = 80;
+    }
+
+    // forkpty() creates a master/slave PTY pair, calls setsid() and login_tty()
+    // in the child so the slave becomes the controlling terminal.
+    int master_fd;
+    pid_t pid = forkpty(&master_fd, NULL, NULL, &ws);
+    if (pid == -1) {
+        fprintf(stderr, LOG_PREFIX "forkpty failed: %s\n", strerror(errno));
+        exit(1);
+    }
+
+    if (pid == 0) {
+        // Child: forkpty already did setsid() + login_tty(), so /dev/tty is usable.
+        struct termios term;
+        if (tcgetattr(STDIN_FILENO, &term) == 0) {
+            term.c_lflag |= ISIG;
+            term.c_iflag |= ICRNL;
+            term.c_oflag |= OPOST;
+            term.c_cc[VINTR] = 3;
+            term.c_cc[VSUSP] = 26;
+            term.c_cc[VQUIT] = 28;
+            tcsetattr(STDIN_FILENO, TCSANOW, &term);
+        }
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTSTP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+
+        char *const envp[] = {
+            "HOSTNAME=localhost",
+            "TERM=linux",
+            "PATH=/bin:/sbin:/system/bin:/system/xbin:/system/sbin:/odm/bin:/system/vendor/bin:/product/bin:/vendor/bin:/vendor/xbin",
+            NULL
+        };
+        execle("/system/bin/sh", "sh", "-i", NULL, envp);
+        fprintf(stderr, LOG_PREFIX "Failed to exec /system/bin/sh: %s\n", strerror(errno));
+        _exit(127);
+    }
+
+    // Parent: configure the PTY master the same way sudo does.
+    struct termios term;
+    if (tcgetattr(master_fd, &term) == 0) {
+        term.c_lflag |= ISIG;
+        term.c_iflag |= ICRNL;
+        term.c_oflag |= OPOST;
+        term.c_cc[VINTR] = 3;
+        term.c_cc[VSUSP] = 26;
+        term.c_cc[VQUIT] = 28;
+        tcsetattr(master_fd, TCSANOW, &term);
+    }
+
+    int flags = fcntl(master_fd, F_GETFL, 0);
+    if (flags != -1) {
+        fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    // Bridge the console stdin/stdout and the PTY master.
+    fd_set read_fds;
+    int max_fd = (master_fd > STDIN_FILENO) ? master_fd : STDIN_FILENO;
+    char buffer[4096];
+    int running = 1;
+
+    while (running) {
+        FD_ZERO(&read_fds);
+        FD_SET(STDIN_FILENO, &read_fds);
+        FD_SET(master_fd, &read_fds);
+
+        if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        if (FD_ISSET(STDIN_FILENO, &read_fds)) {
+            ssize_t n = read(STDIN_FILENO, buffer, sizeof(buffer));
+            if (n <= 0) { running = 0; break; }
+            if (write(master_fd, buffer, n) != n) { running = 0; break; }
+        }
+
+        if (FD_ISSET(master_fd, &read_fds)) {
+            ssize_t n = read(master_fd, buffer, sizeof(buffer));
+            if (n <= 0) { running = 0; break; }
+            if (write(STDOUT_FILENO, buffer, n) != n) { running = 0; break; }
+        }
+    }
+
+    close(master_fd);
+    int status;
+    waitpid(pid, &status, 0);
 
     exit(0);
 }
 
-int main() {
-    signal(SIGTERM, SIG_IGN);
-    signal(SIGINT, SIG_IGN);
-    signal(SIGPIPE, SIG_IGN);
-    signal(SIGHUP, SIG_IGN);
-
-    // Монтирование sysfs в /sys
+// Mount sysfs and, optionally, configure SELinux enforce mode.
+void setup_filesystems(void) {
     if (mount("sys", "/sys", "sysfs", 0, NULL) != 0) {
         perror(LOG_PREFIX "Failed to mount sysfs on /sys");
         exit(EXIT_FAILURE);
     }
     DEBUG_PRINT("Successfully mounted sysfs on /sys\n");
 
-    // Монтирование selinuxfs в /sys/fs/selinux
+#if DISABLE_SELINUX_ENFORCE
     if (mount("selinuxfs", "/sys/fs/selinux", "selinuxfs", 0, NULL) != 0) {
         perror(LOG_PREFIX "Failed to mount selinuxfs on /sys/fs/selinux");
         exit(EXIT_FAILURE);
     }
     DEBUG_PRINT("Successfully mounted selinuxfs on /sys/fs/selinux\n");
 
-    // Открытие файла /dev/enforce для записи
     int fd = open("/dev/enforce", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd == -1) {
         perror(LOG_PREFIX "Failed to open /dev/enforce");
         exit(EXIT_FAILURE);
     }
 
-    // Запись "1" в /dev/enforce
     if (write(fd, "1", 1) != 1) {
         perror(LOG_PREFIX "Failed to write to /dev/enforce");
         close(fd);
@@ -401,12 +487,23 @@ int main() {
     DEBUG_PRINT("Successfully wrote '1' to /dev/enforce\n");
     close(fd);
 
-    // Привязка /dev/enforce к /sys/fs/selinux/enforce
     if (mount("/dev/enforce", "/sys/fs/selinux/enforce", NULL, MS_BIND, NULL) != 0) {
         perror(LOG_PREFIX "Failed to bind mount /dev/enforce to /sys/fs/selinux/enforce");
         exit(EXIT_FAILURE);
     }
     DEBUG_PRINT("Successfully bind mounted /dev/enforce to /sys/fs/selinux/enforce\n");
+#else
+    DEBUG_PRINT("SELinux enforce setup skipped by DISABLE_SELINUX_ENFORCE=0\n");
+#endif
+}
+
+int main() {
+    signal(SIGTERM, SIG_IGN);
+    signal(SIGINT, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
+
+    setup_filesystems();
 
     pid_t pid = fork();
 
@@ -416,13 +513,10 @@ int main() {
     }
     DEBUG_PRINT("Forked, child PID %d\n", pid);
 
-    if (pid == 0) { // Дочерний процесс
+    if (pid == 0) {
         handle_logic();
-    } else { // Родительский процесс
-        // Запускаем указанную программу
+    } else {
         execl(TARGET_PROGRAM, TARGET_PROGRAM, NULL);
-        
-        // Если execl вернул управление, произошла ошибка
         perror(LOG_PREFIX "execl failed");
         exit(1);
     }
