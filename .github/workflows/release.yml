@@ -27,20 +27,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential wget
 
-      - name: Download musl ARM toolchain
+      - name: Download musl aarch64 toolchain
         run: |
-          wget -q "https://musl.cc/arm-linux-musleabihf-cross.tgz" -O musl.tgz
+          wget -q "https://musl.cc/aarch64-linux-musl-cross.tgz" -O musl.tgz
           tar -xzf musl.tgz
-          echo "$PWD/arm-linux-musleabihf-cross/bin" >> "$GITHUB_PATH"
+          echo "$PWD/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
 
       - name: Build myinit-max
-        run: arm-linux-musleabihf-gcc -static -s ./myinit-max.c -o myinit-max
+        run: aarch64-linux-musl-gcc -static -s ./myinit-max.c -o myinit-max
 
       - name: Build myinit-max-dbg
-        run: arm-linux-musleabihf-gcc -static -DDEBUG -s ./myinit-max.c -o myinit-max-dbg
+        run: aarch64-linux-musl-gcc -static -DDEBUG -s ./myinit-max.c -o myinit-max-dbg
 
       - name: Build mysudo
-        run: arm-linux-musleabihf-gcc -static -s ./mysudo.c -o mysudo
+        run: aarch64-linux-musl-gcc -static -s ./mysudo.c -o mysudo
+
+      - name: Verify binaries
+        run: |
+          file myinit-max myinit-max-dbg mysudo
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
