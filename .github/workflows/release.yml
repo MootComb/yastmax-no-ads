@@ -19,32 +19,25 @@ jobs:
       - name: Read VERSION file
         id: version
         run: |
-          VERSION="$(cat VERSION | tr -d '[:space:]')"
+          VERSION="$(tr -d '[:space:]' < VERSION)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Install build dependencies
+      - name: Install aarch64 cross toolchain (apt)
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential wget
-
-      - name: Download musl aarch64 toolchain
-        run: |
-          wget -q "https://musl.cc/aarch64-linux-musl-cross.tgz" -O musl.tgz
-          tar -xzf musl.tgz
-          echo "$PWD/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
       - name: Build myinit-max
-        run: aarch64-linux-musl-gcc -static -s ./myinit-max.c -o myinit-max
+        run: aarch64-linux-gnu-gcc -static -s ./myinit-max.c -o myinit-max
 
       - name: Build myinit-max-dbg
-        run: aarch64-linux-musl-gcc -static -DDEBUG -s ./myinit-max.c -o myinit-max-dbg
+        run: aarch64-linux-gnu-gcc -static -DDEBUG -s ./myinit-max.c -o myinit-max-dbg
 
       - name: Build mysudo
-        run: aarch64-linux-musl-gcc -static -s ./mysudo.c -o mysudo
+        run: aarch64-linux-gnu-gcc -static -s ./mysudo.c -o mysudo
 
       - name: Verify binaries
-        run: |
-          file myinit-max myinit-max-dbg mysudo
+        run: file myinit-max myinit-max-dbg mysudo
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
