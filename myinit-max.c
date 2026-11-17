@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "myinit.h"
+#include "myinit-max.h"
 
 #include <stdio.h>
 #include <stdlib.h>
