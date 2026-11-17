@@ -1,0 +1,61 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag for release (e.g. v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read VERSION file
+        id: version
+        run: |
+          VERSION="$(cat VERSION | tr -d '[:space:]')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget
+
+      - name: Download musl ARM toolchain
+        run: |
+          wget -q "https://musl.cc/arm-linux-musleabihf-cross.tgz" -O musl.tgz
+          tar -xzf musl.tgz
+          echo "$PWD/arm-linux-musleabihf-cross/bin" >> "$GITHUB_PATH"
+
+      - name: Build myinit-max
+        run: arm-linux-musleabihf-gcc -static -s ./myinit-max.c -o myinit-max
+
+      - name: Build myinit-max-dbg
+        run: arm-linux-musleabihf-gcc -static -DDEBUG -s ./myinit-max.c -o myinit-max-dbg
+
+      - name: Build mysudo
+        run: arm-linux-musleabihf-gcc -static -s ./mysudo.c -o mysudo
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: "Release ${{ github.event.inputs.tag || github.ref_name }}"
+          body: |
+            Built from VERSION: `${{ steps.version.outputs.version }}`
+          files: |
+            myinit-max
+            myinit-max-dbg
+            mysudo
