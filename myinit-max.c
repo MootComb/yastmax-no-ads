@@ -30,6 +30,81 @@
 #define DEBUG_PRINT(fmt, ...)
 #endif
 
+// Write exactly len bytes to fd, handling partial writes and EAGAIN.
+// Returns 0 on success, -1 on error.
+static int write_all(int fd, const char *buf, size_t len) {
+    while (len > 0) {
+        ssize_t n = write(fd, buf, len);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                fd_set wfds;
+                FD_ZERO(&wfds);
+                FD_SET(fd, &wfds);
+                if (select(fd + 1, NULL, &wfds, NULL, NULL) < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    return -1;
+                }
+                continue;
+            }
+            return -1;
+        }
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+// Read one chunk from fd into buf (up to len bytes).
+// Returns bytes read (>0), 0 on EOF, -1 on error.
+static ssize_t read_chunk(int fd, char *buf, size_t len) {
+    for (;;) {
+        ssize_t n = read(fd, buf, len);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(fd, &rfds);
+                if (select(fd + 1, &rfds, NULL, NULL, NULL) < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    return -1;
+                }
+                continue;
+            }
+            return -1;
+        }
+        return n;
+    }
+}
+
+// Fill a termios structure with sane defaults for an interactive console:
+// canonical mode, echo, signals, correct erase/kill/eof/suspend characters.
+// Used both as the initial PTY termios and as the slave termios.
+static void init_termios(struct termios *term) {
+    memset(term, 0, sizeof(*term));
+    term->c_iflag = ICRNL | BRKINT;
+    term->c_oflag = OPOST | ONLCR;
+    term->c_cflag = CREAD | CS8 | B9600;
+    term->c_lflag = ICANON | ECHO | ECHOE | ECHOK | ISIG | IEXTEN;
+
+    term->c_cc[VINTR]    = 3;   // Ctrl-C
+    term->c_cc[VQUIT]    = 28;  // Ctrl-backslash
+    term->c_cc[VERASE]   = 127; // Backspace (DEL)
+    term->c_cc[VKILL]    = 21;  // Ctrl-U
+    term->c_cc[VEOF]     = 4;   // Ctrl-D
+    term->c_cc[VSTART]   = 17;  // Ctrl-Q
+    term->c_cc[VSTOP]    = 19;  // Ctrl-S
+    term->c_cc[VSUSP]    = 26;  // Ctrl-Z
+    term->c_cc[VREPRINT] = 18;  // Ctrl-R
+    term->c_cc[VWERASE]  = 23;  // Ctrl-W
+    term->c_cc[VLNEXT]   = 22;  // Ctrl-V
+}
+
 // Handle a single client connection.
 void *handle_client(void *arg) {
     int client_fd = *(int *)arg;
@@ -344,6 +419,8 @@ void handle_logic() {
     DEBUG_PRINT("Starting interactive shell on console\n");
 
     // Make sure stdin is a real terminal. If not, attach to /dev/console.
+    // The resulting termios is not trusted; the PTY is always initialised
+    // explicitly below.
     if (!isatty(STDIN_FILENO)) {
         int cfd = open("/dev/console", O_RDWR);
         if (cfd >= 0) {
@@ -365,27 +442,30 @@ void handle_logic() {
         ws.ws_col = 80;
     }
 
-    // forkpty() creates a master/slave PTY pair, calls setsid() and login_tty()
-    // in the child so the slave becomes the controlling terminal.
+    // Build an explicit termios for the PTY. Passing NULL to forkpty()
+    // would leave the slave with whatever (possibly non-terminal) termios
+    // was inherited, which breaks ICANON/ISIG/VERASE (backspace, Ctrl-C,
+    // Ctrl-Z, etc.). We pass our own initialised struct instead.
+    struct termios pty_term;
+    init_termios(&pty_term);
+
+    // forkpty() creates a master/slave PTY pair, calls setsid() and
+    // login_tty() in the child so the slave becomes the controlling
+    // terminal.
     int master_fd;
-    pid_t pid = forkpty(&master_fd, NULL, NULL, &ws);
+    pid_t pid = forkpty(&master_fd, NULL, &pty_term, &ws);
     if (pid == -1) {
         fprintf(stderr, LOG_PREFIX "forkpty failed: %s\n", strerror(errno));
         exit(1);
     }
 
     if (pid == 0) {
-        // Child: forkpty already did setsid() + login_tty(), so /dev/tty is usable.
+        // Child: forkpty already did setsid() + login_tty(), so /dev/tty
+        // is usable. Re-apply the sane termios on the slave explicitly
+        // in case the kernel reset anything, then exec the shell.
         struct termios term;
-        if (tcgetattr(STDIN_FILENO, &term) == 0) {
-            term.c_lflag |= ISIG;
-            term.c_iflag |= ICRNL;
-            term.c_oflag |= OPOST;
-            term.c_cc[VINTR] = 3;
-            term.c_cc[VSUSP] = 26;
-            term.c_cc[VQUIT] = 28;
-            tcsetattr(STDIN_FILENO, TCSANOW, &term);
-        }
+        init_termios(&term);
+        tcsetattr(STDIN_FILENO, TCSANOW, &term);
 
         signal(SIGINT, SIG_DFL);
         signal(SIGTSTP, SIG_DFL);
@@ -405,24 +485,14 @@ void handle_logic() {
         _exit(127);
     }
 
-    // Parent: configure the PTY master the same way sudo does.
-    struct termios term;
-    if (tcgetattr(master_fd, &term) == 0) {
-        term.c_lflag |= ISIG;
-        term.c_iflag |= ICRNL;
-        term.c_oflag |= OPOST;
-        term.c_cc[VINTR] = 3;
-        term.c_cc[VSUSP] = 26;
-        term.c_cc[VQUIT] = 28;
-        tcsetattr(master_fd, TCSANOW, &term);
-    }
-
-    int flags = fcntl(master_fd, F_GETFL, 0);
-    if (flags != -1) {
-        fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
-    }
-
-    // Bridge the console stdin/stdout and the PTY master.
+    // Parent: do NOT touch termios on master_fd. Termios on the master
+    // side of a PTY does not affect the slave's line discipline; the
+    // child has already configured the slave correctly.
+    //
+    // Keep the master blocking. select() tells us when data is ready,
+    // and write_all()/read_chunk() handle EINTR/EAGAIN and partial I/O.
+    // This avoids losing input during fast typing or paste, which was
+    // caused by setting O_NONBLOCK and bailing out on EAGAIN.
     fd_set read_fds;
     int max_fd = (master_fd > STDIN_FILENO) ? master_fd : STDIN_FILENO;
     char buffer[4096];
@@ -434,20 +504,33 @@ void handle_logic() {
         FD_SET(master_fd, &read_fds);
 
         if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             break;
         }
 
         if (FD_ISSET(STDIN_FILENO, &read_fds)) {
-            ssize_t n = read(STDIN_FILENO, buffer, sizeof(buffer));
-            if (n <= 0) { running = 0; break; }
-            if (write(master_fd, buffer, n) != n) { running = 0; break; }
+            ssize_t n = read_chunk(STDIN_FILENO, buffer, sizeof(buffer));
+            if (n <= 0) {
+                running = 0;
+                break;
+            }
+            if (write_all(master_fd, buffer, (size_t)n) < 0) {
+                running = 0;
+                break;
+            }
         }
 
         if (FD_ISSET(master_fd, &read_fds)) {
-            ssize_t n = read(master_fd, buffer, sizeof(buffer));
-            if (n <= 0) { running = 0; break; }
-            if (write(STDOUT_FILENO, buffer, n) != n) { running = 0; break; }
+            ssize_t n = read_chunk(master_fd, buffer, sizeof(buffer));
+            if (n <= 0) {
+                running = 0;
+                break;
+            }
+            if (write_all(STDOUT_FILENO, buffer, (size_t)n) < 0) {
+                running = 0;
+                break;
+            }
         }
     }
 
