@@ -30,7 +30,45 @@
 #define DEBUG_PRINT(fmt, ...)
 #endif
 
-// Write exactly len bytes to fd, handling partial writes and EAGAIN.
+static struct termios g_saved_console_termios;
+static int g_console_raw = 0;
+
+// Put the real console into raw mode. This is the critical fix:
+// while the console is in canonical + ISIG mode, the line discipline
+// consumes backspace, Ctrl-C, Ctrl-Z, Ctrl-\ and friends before init's
+// read() ever sees them. sudo works because its client puts the console
+// into raw mode; init must do the same.
+static void console_enter_raw(void) {
+    struct termios raw;
+
+    if (!isatty(STDIN_FILENO))
+        return;
+
+    if (tcgetattr(STDIN_FILENO, &g_saved_console_termios) < 0)
+        return;
+
+    raw = g_saved_console_termios;
+    raw.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    raw.c_oflag &= ~OPOST;
+    raw.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    raw.c_cflag &= ~(CSIZE | PARENB);
+    raw.c_cflag |= CS8;
+    raw.c_cc[VMIN]  = 1;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0)
+        g_console_raw = 1;
+}
+
+// Restore the console termios saved by console_enter_raw().
+static void console_restore(void) {
+    if (g_console_raw) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_console_termios);
+        g_console_raw = 0;
+    }
+}
+
+// Write exactly len bytes to fd, handling partial writes, EINTR and EAGAIN.
 // Returns 0 on success, -1 on error.
 static int write_all(int fd, const char *buf, size_t len) {
     while (len > 0) {
@@ -57,7 +95,7 @@ static int write_all(int fd, const char *buf, size_t len) {
     return 0;
 }
 
-// Read one chunk from fd into buf (up to len bytes).
+// Read one chunk from fd into buf (up to len bytes), handling EINTR/EAGAIN.
 // Returns bytes read (>0), 0 on EOF, -1 on error.
 static ssize_t read_chunk(int fd, char *buf, size_t len) {
     for (;;) {
@@ -82,10 +120,11 @@ static ssize_t read_chunk(int fd, char *buf, size_t len) {
     }
 }
 
-// Fill a termios structure with sane defaults for an interactive console:
-// canonical mode, echo, signals, correct erase/kill/eof/suspend characters.
-// Used both as the initial PTY termios and as the slave termios.
-static void init_termios(struct termios *term) {
+// Fill a termios structure with sane defaults for the slave side of the
+// interactive PTY: canonical mode, echo, signals, correct control chars.
+// This is what the shell inside the PTY sees, so it must have ICANON,
+// ECHO, ISIG and a valid VERASE for backspace to work.
+static void init_slave_termios(struct termios *term) {
     memset(term, 0, sizeof(*term));
     term->c_iflag = ICRNL | BRKINT;
     term->c_oflag = OPOST | ONLCR;
@@ -419,8 +458,6 @@ void handle_logic() {
     DEBUG_PRINT("Starting interactive shell on console\n");
 
     // Make sure stdin is a real terminal. If not, attach to /dev/console.
-    // The resulting termios is not trusted; the PTY is always initialised
-    // explicitly below.
     if (!isatty(STDIN_FILENO)) {
         int cfd = open("/dev/console", O_RDWR);
         if (cfd >= 0) {
@@ -442,18 +479,16 @@ void handle_logic() {
         ws.ws_col = 80;
     }
 
-    // Build an explicit termios for the PTY. Passing NULL to forkpty()
-    // would leave the slave with whatever (possibly non-terminal) termios
-    // was inherited, which breaks ICANON/ISIG/VERASE (backspace, Ctrl-C,
-    // Ctrl-Z, etc.). We pass our own initialised struct instead.
-    struct termios pty_term;
-    init_termios(&pty_term);
+    // Build an explicit termios for the slave side of the PTY. Passing
+    // NULL to forkpty() would leave the slave with the inherited termios,
+    // which may lack ICANON/ECHO/ISIG/VERASE. We want a fully configured
+    // slave so the shell inside the PTY gets proper line editing and
+    // signal generation.
+    struct termios slave_term;
+    init_slave_termios(&slave_term);
 
-    // forkpty() creates a master/slave PTY pair, calls setsid() and
-    // login_tty() in the child so the slave becomes the controlling
-    // terminal.
     int master_fd;
-    pid_t pid = forkpty(&master_fd, NULL, &pty_term, &ws);
+    pid_t pid = forkpty(&master_fd, NULL, &slave_term, &ws);
     if (pid == -1) {
         fprintf(stderr, LOG_PREFIX "forkpty failed: %s\n", strerror(errno));
         exit(1);
@@ -461,10 +496,10 @@ void handle_logic() {
 
     if (pid == 0) {
         // Child: forkpty already did setsid() + login_tty(), so /dev/tty
-        // is usable. Re-apply the sane termios on the slave explicitly
-        // in case the kernel reset anything, then exec the shell.
+        // is usable. Re-apply the slave termios explicitly in case the
+        // kernel reset anything, then exec the shell.
         struct termios term;
-        init_termios(&term);
+        init_slave_termios(&term);
         tcsetattr(STDIN_FILENO, TCSANOW, &term);
 
         signal(SIGINT, SIG_DFL);
@@ -485,14 +520,22 @@ void handle_logic() {
         _exit(127);
     }
 
-    // Parent: do NOT touch termios on master_fd. Termios on the master
-    // side of a PTY does not affect the slave's line discipline; the
-    // child has already configured the slave correctly.
+    // Parent: put the real console into raw mode BEFORE bridging. This is
+    // the critical fix. While the console is in canonical + ISIG mode, the
+    // line discipline eats backspace, Ctrl-C, Ctrl-Z, Ctrl-\ etc. before
+    // init's read() sees them. With the console in raw mode the bytes pass
+    // through untouched to the PTY master, and the slave's line discipline
+    // (which has ISIG/ICANON set) generates the correct signals and line
+    // editing for the shell.
     //
-    // Keep the master blocking. select() tells us when data is ready,
-    // and write_all()/read_chunk() handle EINTR/EAGAIN and partial I/O.
-    // This avoids losing input during fast typing or paste, which was
-    // caused by setting O_NONBLOCK and bailing out on EAGAIN.
+    // Do NOT call tcsetattr() on master_fd: termios on the master side of
+    // a PTY does not affect the slave's line discipline.
+    //
+    // Keep the master blocking; write_all()/read_chunk() handle EINTR and
+    // EAGAIN, and select() gates each transfer. This avoids losing input
+    // during fast typing or paste.
+    console_enter_raw();
+
     fd_set read_fds;
     int max_fd = (master_fd > STDIN_FILENO) ? master_fd : STDIN_FILENO;
     char buffer[4096];
@@ -533,6 +576,9 @@ void handle_logic() {
             }
         }
     }
+
+    // Restore the console termios before exiting.
+    console_restore();
 
     close(master_fd);
     int status;
