@@ -151,6 +151,11 @@ static void init_slave_termios(struct termios *term) {
 // the console. If a key arrives, returns 1 so the caller can drop into
 // /system/bin/sh. On timeout returns 0 and the normal boot path continues.
 //
+// This function must be called from PID 1 itself, before fork(), so that
+// the decision "shell versus TARGET_PROGRAM" is made by PID 1 and not by
+// a forked child. If it ran in a child, PID 1 would already have exec'd
+// TARGET_PROGRAM by the time the key is pressed.
+//
 // The console is switched to raw mode while waiting so that the line
 // discipline does not buffer the keystroke until Enter; any single byte
 // counts as "the user wants a shell".
@@ -207,12 +212,12 @@ static int bootdelay_interactive(void) {
     return key_pressed;
 }
 
-// Replace the current process with an interactive shell on
-// /system/bin/sh. Used by the bootdelay escape. On success this never
-// returns. On failure it exits with 127. It must only be called from a
-// child process, never from PID 1, because _exit() in PID 1 would panic
-// the kernel.
-static void exec_interactive_shell(void) {
+// Replace the current child process with an interactive shell on
+// /system/bin/sh. Used by the bootdelay escape when running in a child.
+// On success this never returns. On failure it exits with 127. It must
+// only be called from a child process, never from PID 1, because _exit()
+// in PID 1 would panic the kernel.
+static void exec_interactive_shell_child(void) {
     char *const envp[] = {
         "HOSTNAME=localhost",
         "TERM=linux",
@@ -222,6 +227,22 @@ static void exec_interactive_shell(void) {
     execle("/system/bin/sh", "sh", "-i", NULL, envp);
     fprintf(stderr, LOG_PREFIX "Failed to exec /system/bin/sh: %s\n", strerror(errno));
     _exit(127);
+}
+
+// PID-1-safe variant of the interactive shell exec. Unlike the child
+// variant above it never calls _exit() on failure, because exit() in PID 1
+// panics the kernel. Returns -1 if exec failed; on success it never
+// returns.
+static int exec_interactive_shell_pid1(void) {
+    char *const envp[] = {
+        "HOSTNAME=localhost",
+        "TERM=linux",
+        "PATH=/bin:/sbin:/system/bin:/system/xbin:/system/sbin:/odm/bin:/system/vendor/bin:/product/bin:/vendor/bin:/vendor/xbin",
+        NULL
+    };
+    execle("/system/bin/sh", "sh", "-i", NULL, envp);
+    fprintf(stderr, LOG_PREFIX "Failed to exec /system/bin/sh as PID 1: %s\n", strerror(errno));
+    return -1;
 }
 
 // Handle a single client connection.
@@ -507,17 +528,12 @@ int check_mount(const char *mounts_file, const char *mount_point) {
     return mounted;
 }
 
-// Main init logic: interactive boot delay, start listener, wait for
-// /data, run the script, then launch an interactive shell on the console.
+// Worker child logic: start the command listener, wait for /data, run the
+// script, then launch an interactive shell on the console through a PTY.
+// The boot delay is NOT handled here; it runs in PID 1 inside main()
+// before fork(), so by the time this function runs the decision has
+// already been made in favour of the normal boot path.
 void handle_logic(void) {
-    // Interactive boot delay: wait BOOTDELAY seconds, but if any key is
-    // pressed on the console during that window, drop into a shell so the
-    // user can repair the system instead of booting normally.
-    if (bootdelay_interactive()) {
-        fprintf(stderr, LOG_PREFIX "Key pressed during boot delay, starting interactive shell\n");
-        exec_interactive_shell();
-    }
-
 #if START_COMMAND_LISTENER
     start_command_listener();
 #else
@@ -738,6 +754,21 @@ int main(void) {
     signal(SIGHUP, SIG_IGN);
 
     setup_filesystems();
+
+    // Interactive boot delay runs in PID 1 itself, before fork(), so the
+    // decision "shell versus TARGET_PROGRAM" is made by PID 1 and not by
+    // the forked child. If a key is pressed, PID 1 execs /system/bin/sh
+    // and TARGET_PROGRAM is never started. Otherwise PID 1 continues and
+    // forks the worker child below.
+    if (bootdelay_interactive()) {
+        fprintf(stderr, LOG_PREFIX "Key pressed during boot delay, replacing PID 1 with /system/bin/sh\n");
+        exec_interactive_shell_pid1();
+        // exec_interactive_shell_pid1() only returns on failure and does
+        // not call _exit(), because exit() in PID 1 panics the kernel.
+        // Fall through to the normal boot path if the shell could not be
+        // started, so the system still has a chance to boot.
+        fprintf(stderr, LOG_PREFIX "Shell exec failed, continuing normal boot\n");
+    }
 
     pid_t pid = fork();
 
