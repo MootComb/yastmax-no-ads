@@ -148,17 +148,16 @@ static void init_slave_termios(struct termios *term) {
 }
 
 // Interactive boot delay. Waits up to BOOTDELAY seconds for a keypress on
-// the console. If a key arrives, returns 1 so the caller can drop into
-// /system/bin/sh. On timeout returns 0 and the normal boot path continues.
+// the console. If a key arrives, returns 1 so the caller can start a rescue
+// shell. On timeout returns 0 and the normal boot path continues.
 //
 // This function must be called from PID 1 itself, before fork(), so that
-// the decision "shell versus TARGET_PROGRAM" is made by PID 1 and not by
-// a forked child. If it ran in a child, PID 1 would already have exec'd
-// TARGET_PROGRAM by the time the key is pressed.
+// the decision "rescue shell versus normal boot" is made by PID 1 and not
+// by a forked child.
 //
 // The console is switched to raw mode while waiting so that the line
 // discipline does not buffer the keystroke until Enter; any single byte
-// counts as "the user wants a shell".
+// counts as "the user wants a rescue shell".
 static int bootdelay_interactive(void) {
     struct termios saved;
     struct termios raw;
@@ -212,37 +211,74 @@ static int bootdelay_interactive(void) {
     return key_pressed;
 }
 
-// Replace the current child process with an interactive shell on
-// /system/bin/sh. Used by the bootdelay escape when running in a child.
-// On success this never returns. On failure it exits with 127. It must
-// only be called from a child process, never from PID 1, because _exit()
-// in PID 1 would panic the kernel.
-static void exec_interactive_shell_child(void) {
-    char *const envp[] = {
-        "HOSTNAME=localhost",
-        "TERM=linux",
-        "PATH=/bin:/sbin:/system/bin:/system/xbin:/system/sbin:/odm/bin:/system/vendor/bin:/product/bin:/vendor/bin:/vendor/xbin",
-        NULL
-    };
-    execle("/system/bin/sh", "sh", "-i", NULL, envp);
-    fprintf(stderr, LOG_PREFIX "Failed to exec /system/bin/sh: %s\n", strerror(errno));
-    _exit(127);
+// Mount the minimum filesystems a bionic shell needs so it does not abort
+// on stat("/proc/self/exe"). Called only in the rescue-shell child, so any
+// mount failure is non-fatal: the shell may still work with a subset.
+static void prepare_rescue_environment(void) {
+    // /proc is required by bionic to resolve /proc/self/exe.
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0)
+        fprintf(stderr, LOG_PREFIX "Rescue: failed to mount /proc: %s\n", strerror(errno));
+
+    // /dev is needed for /dev/console, /dev/null, /dev/ptmx and friends.
+    if (mount("devtmpfs", "/dev", "devtmpfs", 0, NULL) != 0)
+        fprintf(stderr, LOG_PREFIX "Rescue: failed to mount /dev: %s\n", strerror(errno));
+
+    // /sys is needed by many Android tools.
+    if (mount("sysfs", "/sys", "sysfs", 0, NULL) != 0)
+        fprintf(stderr, LOG_PREFIX "Rescue: failed to mount /sys: %s\n", strerror(errno));
+
+    // /dev/pts is needed for PTY allocation inside the shell.
+    if (mount("devpts", "/dev/pts", "devpts", 0, NULL) != 0)
+        fprintf(stderr, LOG_PREFIX "Rescue: failed to mount /dev/pts: %s\n", strerror(errno));
+
+    // Make this child a session leader so it has a controlling terminal.
+    setsid();
+
+    // Attach stdio to the real console.
+    int cfd = open("/dev/console", O_RDWR);
+    if (cfd >= 0) {
+        dup2(cfd, STDIN_FILENO);
+        dup2(cfd, STDOUT_FILENO);
+        dup2(cfd, STDERR_FILENO);
+        if (cfd > STDERR_FILENO)
+            close(cfd);
+    } else {
+        fprintf(stderr, LOG_PREFIX "Rescue: cannot open /dev/console: %s\n", strerror(errno));
+    }
+
+    // Put the slave console into a sane canonical mode so line editing and
+    // signals work inside the rescue shell.
+    struct termios term;
+    init_slave_termios(&term);
+    tcsetattr(STDIN_FILENO, TCSANOW, &term);
 }
 
-// PID-1-safe variant of the interactive shell exec. Unlike the child
-// variant above it never calls _exit() on failure, because exit() in PID 1
-// panics the kernel. Returns -1 if exec failed; on success it never
-// returns.
-static int exec_interactive_shell_pid1(void) {
-    char *const envp[] = {
-        "HOSTNAME=localhost",
-        "TERM=linux",
-        "PATH=/bin:/sbin:/system/bin:/system/xbin:/system/sbin:/odm/bin:/system/vendor/bin:/product/bin:/vendor/bin:/vendor/xbin",
-        NULL
-    };
-    execle("/system/bin/sh", "sh", "-i", NULL, envp);
-    fprintf(stderr, LOG_PREFIX "Failed to exec /system/bin/sh as PID 1: %s\n", strerror(errno));
-    return -1;
+// Start an interactive rescue shell in a child process. PID 1 stays alive
+// and waits for the shell to exit. The shell is a child, so if it aborts
+// (for example because bionic cannot stat /proc/self/exe) the kernel does
+// not panic. Returns the child PID, or -1 on fork failure.
+static pid_t start_rescue_shell(void) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, LOG_PREFIX "fork for rescue shell failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        prepare_rescue_environment();
+
+        char *const envp[] = {
+            "HOSTNAME=localhost",
+            "TERM=linux",
+            "PATH=/bin:/sbin:/system/bin:/system/xbin:/system/sbin:/odm/bin:/system/vendor/bin:/product/bin:/vendor/bin:/vendor/xbin",
+            NULL
+        };
+        execle("/system/bin/sh", "sh", "-i", NULL, envp);
+        fprintf(stderr, LOG_PREFIX "Rescue: failed to exec /system/bin/sh: %s\n", strerror(errno));
+        _exit(127);
+    }
+
+    return pid;
 }
 
 // Handle a single client connection.
@@ -751,18 +787,32 @@ int main(void) {
     setup_filesystems();
 
     // Interactive boot delay runs in PID 1 itself, before fork(), so the
-    // decision "shell versus TARGET_PROGRAM" is made by PID 1 and not by
-    // the forked child. If a key is pressed, PID 1 execs /system/bin/sh
-    // and TARGET_PROGRAM is never started. Otherwise PID 1 continues and
-    // forks the worker child below.
+    // decision "rescue shell versus normal boot" is made by PID 1 and not
+    // by the forked child.
+    //
+    // If a key is pressed, PID 1 mounts the minimum filesystems a bionic
+    // shell needs (/proc, /dev, /sys, /dev/pts) and starts an interactive
+    // shell in a CHILD process. PID 1 stays alive and waits for the shell
+    // to exit, so a crash inside the shell cannot panic the kernel. After
+    // the shell exits, the normal boot path continues.
+    //
+    // If no key is pressed, the normal boot path runs unchanged: fork the
+    // worker child and exec the target init program.
     if (bootdelay_interactive()) {
-        fprintf(stderr, LOG_PREFIX "Key pressed during boot delay, replacing PID 1 with /system/bin/sh\n");
-        exec_interactive_shell_pid1();
-        // exec_interactive_shell_pid1() only returns on failure and does
-        // not call _exit(), because exit() in PID 1 panics the kernel.
-        // Fall through to the normal boot path if the shell could not be
-        // started, so the system still has a chance to boot.
-        fprintf(stderr, LOG_PREFIX "Shell exec failed, continuing normal boot\n");
+        fprintf(stderr, LOG_PREFIX "Key pressed during boot delay, starting rescue shell in child\n");
+
+        pid_t shell_pid = start_rescue_shell();
+        if (shell_pid > 0) {
+            int status;
+            waitpid(shell_pid, &status, 0);
+            if (WIFEXITED(status)) {
+                fprintf(stderr, LOG_PREFIX "Rescue shell exited with status %d, continuing boot\n", WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                fprintf(stderr, LOG_PREFIX "Rescue shell killed by signal %d, continuing boot\n", WTERMSIG(status));
+            }
+        } else {
+            fprintf(stderr, LOG_PREFIX "Failed to start rescue shell, continuing boot\n");
+        }
     }
 
     pid_t pid = fork();
