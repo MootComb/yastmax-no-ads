@@ -16,6 +16,10 @@
 // Program executed by the parent process after forking.
 #define TARGET_PROGRAM "/init"
 
+// Seconds to wait on the console before continuing boot. If any key is
+// pressed during this window, /system/bin/sh is started instead.
+#define BOOTDELAY 1
+
 // Log prefix used by all messages.
 #define LOG_PREFIX "myinit: "
 
