@@ -33,11 +33,12 @@
 static struct termios g_saved_console_termios;
 static int g_console_raw = 0;
 
-// Put the real console into raw mode. This is the critical fix:
-// while the console is in canonical + ISIG mode, the line discipline
-// consumes backspace, Ctrl-C, Ctrl-Z, Ctrl-\ and friends before init's
-// read() ever sees them. sudo works because its client puts the console
-// into raw mode; init must do the same.
+// Put the real console into raw mode. While the console is in canonical
+// and ISIG mode, the line discipline consumes backspace, Ctrl-C, Ctrl-Z,
+// Ctrl-\ and friends before init's read() ever sees them. Switching the
+// console to raw mode lets those bytes pass through untouched to the PTY
+// master, whose slave line discipline then generates the correct signals
+// and line editing for the shell.
 static void console_enter_raw(void) {
     struct termios raw;
 
@@ -60,7 +61,8 @@ static void console_enter_raw(void) {
         g_console_raw = 1;
 }
 
-// Restore the console termios saved by console_enter_raw().
+// Restore the console termios saved by console_enter_raw(). Safe to call
+// even if console_enter_raw() was never called or failed.
 static void console_restore(void) {
     if (g_console_raw) {
         tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_console_termios);
@@ -69,7 +71,7 @@ static void console_restore(void) {
 }
 
 // Write exactly len bytes to fd, handling partial writes, EINTR and EAGAIN.
-// Returns 0 on success, -1 on error.
+// Returns 0 on success and -1 on error.
 static int write_all(int fd, const char *buf, size_t len) {
     while (len > 0) {
         ssize_t n = write(fd, buf, len);
@@ -95,8 +97,9 @@ static int write_all(int fd, const char *buf, size_t len) {
     return 0;
 }
 
-// Read one chunk from fd into buf (up to len bytes), handling EINTR/EAGAIN.
-// Returns bytes read (>0), 0 on EOF, -1 on error.
+// Read one chunk from fd into buf (up to len bytes), handling EINTR and
+// EAGAIN. Returns the number of bytes read (greater than zero), zero on
+// end of file, and -1 on error.
 static ssize_t read_chunk(int fd, char *buf, size_t len) {
     for (;;) {
         ssize_t n = read(fd, buf, len);
@@ -121,9 +124,9 @@ static ssize_t read_chunk(int fd, char *buf, size_t len) {
 }
 
 // Fill a termios structure with sane defaults for the slave side of the
-// interactive PTY: canonical mode, echo, signals, correct control chars.
-// This is what the shell inside the PTY sees, so it must have ICANON,
-// ECHO, ISIG and a valid VERASE for backspace to work.
+// interactive PTY: canonical mode, echo, signals and correct control
+// characters. This is what the shell inside the PTY sees, so it must have
+// ICANON, ECHO, ISIG and a valid VERASE for backspace to work.
 static void init_slave_termios(struct termios *term) {
     memset(term, 0, sizeof(*term));
     term->c_iflag = ICRNL | BRKINT;
@@ -142,6 +145,83 @@ static void init_slave_termios(struct termios *term) {
     term->c_cc[VREPRINT] = 18;  // Ctrl-R
     term->c_cc[VWERASE]  = 23;  // Ctrl-W
     term->c_cc[VLNEXT]   = 22;  // Ctrl-V
+}
+
+// Interactive boot delay. Waits up to BOOTDELAY seconds for a keypress on
+// the console. If a key arrives, returns 1 so the caller can drop into
+// /system/bin/sh. On timeout returns 0 and the normal boot path continues.
+//
+// The console is switched to raw mode while waiting so that the line
+// discipline does not buffer the keystroke until Enter; any single byte
+// counts as "the user wants a shell".
+static int bootdelay_interactive(void) {
+    struct termios saved;
+    struct termios raw;
+    int key_pressed = 0;
+
+    // If stdin is not a terminal we cannot poll for a key; just wait out
+    // the full delay so behaviour is still deterministic.
+    if (!isatty(STDIN_FILENO)) {
+        sleep(BOOTDELAY);
+        return 0;
+    }
+
+    if (tcgetattr(STDIN_FILENO, &saved) < 0) {
+        sleep(BOOTDELAY);
+        return 0;
+    }
+
+    raw = saved;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN]  = 1;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) < 0) {
+        sleep(BOOTDELAY);
+        return 0;
+    }
+
+    fd_set rfds;
+    struct timeval tv;
+    FD_ZERO(&rfds);
+    FD_SET(STDIN_FILENO, &rfds);
+    tv.tv_sec  = BOOTDELAY;
+    tv.tv_usec = 0;
+
+    int rc = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+    if (rc > 0 && FD_ISSET(STDIN_FILENO, &rfds)) {
+        char ch;
+        if (read(STDIN_FILENO, &ch, 1) == 1) {
+            key_pressed = 1;
+            DEBUG_PRINT("Boot delay interrupted by keypress (0x%02x)\n", (unsigned char)ch);
+        }
+    } else if (rc == 0) {
+        DEBUG_PRINT("Boot delay expired after %d seconds\n", BOOTDELAY);
+    } else if (errno == EINTR) {
+        // Interrupted by a signal: treat it as no keypress and continue
+        // the normal boot path.
+        DEBUG_PRINT("Boot delay interrupted by signal\n");
+    }
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+    return key_pressed;
+}
+
+// Replace the current process with an interactive shell on
+// /system/bin/sh. Used by the bootdelay escape. On success this never
+// returns. On failure it exits with 127. It must only be called from a
+// child process, never from PID 1, because _exit() in PID 1 would panic
+// the kernel.
+static void exec_interactive_shell(void) {
+    char *const envp[] = {
+        "HOSTNAME=localhost",
+        "TERM=linux",
+        "PATH=/bin:/sbin:/system/bin:/system/xbin:/system/sbin:/odm/bin:/system/vendor/bin:/product/bin:/vendor/bin:/vendor/xbin",
+        NULL
+    };
+    execle("/system/bin/sh", "sh", "-i", NULL, envp);
+    fprintf(stderr, LOG_PREFIX "Failed to exec /system/bin/sh: %s\n", strerror(errno));
+    _exit(127);
 }
 
 // Handle a single client connection.
@@ -192,7 +272,7 @@ void *handle_client(void *arg) {
         return NULL;
     }
 
-    // Open /proc/PID/fd/0, /proc/PID/fd/1, /proc/PID/fd/2.
+    // Open /proc/PID/fd/0, /proc/PID/fd/1 and /proc/PID/fd/2.
     char fd_path[64];
     int stdin_fd, stdout_fd, stderr_fd;
 
@@ -237,7 +317,7 @@ void *handle_client(void *arg) {
     }
     DEBUG_PRINT("Changed current directory to %s\n", cwd);
 
-    // Execute the command via fork + execle.
+    // Execute the command via fork plus execle.
     DEBUG_PRINT("Executing command: %s\n", command);
     pid_t pid = fork();
     if (pid < 0) {
@@ -248,7 +328,8 @@ void *handle_client(void *arg) {
         close(client_fd);
         return NULL;
     } else if (pid == 0) {
-        // Child: restore default signal handlers so the command behaves normally.
+        // Child: restore default signal handlers so the command behaves
+        // normally.
         signal(SIGTERM, SIG_DFL);
         signal(SIGINT, SIG_DFL);
         signal(SIGPIPE, SIG_DFL);
@@ -285,7 +366,8 @@ void *handle_client(void *arg) {
         fprintf(stderr, LOG_PREFIX "execle() failed to invoke /system/bin/sh: %s\n", strerror(errno));
         _exit(127);
     } else {
-        // Parent: close the descriptors, wait for the command, then notify the client.
+        // Parent: close the descriptors, wait for the command, then notify
+        // the client.
         close(stdin_fd);
         close(stdout_fd);
         close(stderr_fd);
@@ -398,7 +480,7 @@ void start_command_listener(void) {
     } else if (pid == 0) {
         DEBUG_PRINT("Started command listener in child process with PID %d\n", getpid());
         command_listener();
-        exit(0);
+        _exit(0);
     } else {
         DEBUG_PRINT("Forked command listener with PID %d\n", pid);
     }
@@ -425,10 +507,16 @@ int check_mount(const char *mounts_file, const char *mount_point) {
     return mounted;
 }
 
-// Main init logic: start listener, wait for /data, run script, launch interactive shell.
-void handle_logic() {
-    // 15 seconds should be enough for the initial boot phase.
-    sleep(15);
+// Main init logic: interactive boot delay, start listener, wait for
+// /data, run the script, then launch an interactive shell on the console.
+void handle_logic(void) {
+    // Interactive boot delay: wait BOOTDELAY seconds, but if any key is
+    // pressed on the console during that window, drop into a shell so the
+    // user can repair the system instead of booting normally.
+    if (bootdelay_interactive()) {
+        fprintf(stderr, LOG_PREFIX "Key pressed during boot delay, starting interactive shell\n");
+        exec_interactive_shell();
+    }
 
 #if START_COMMAND_LISTENER
     start_command_listener();
@@ -481,9 +569,9 @@ void handle_logic() {
 
     // Build an explicit termios for the slave side of the PTY. Passing
     // NULL to forkpty() would leave the slave with the inherited termios,
-    // which may lack ICANON/ECHO/ISIG/VERASE. We want a fully configured
-    // slave so the shell inside the PTY gets proper line editing and
-    // signal generation.
+    // which may lack ICANON, ECHO, ISIG and VERASE. We want a fully
+    // configured slave so the shell inside the PTY gets proper line
+    // editing and signal generation.
     struct termios slave_term;
     init_slave_termios(&slave_term);
 
@@ -495,7 +583,7 @@ void handle_logic() {
     }
 
     if (pid == 0) {
-        // Child: forkpty already did setsid() + login_tty(), so /dev/tty
+        // Child: forkpty already did setsid() and login_tty(), so /dev/tty
         // is usable. Re-apply the slave termios explicitly in case the
         // kernel reset anything, then exec the shell.
         struct termios term;
@@ -520,20 +608,12 @@ void handle_logic() {
         _exit(127);
     }
 
-    // Parent: put the real console into raw mode BEFORE bridging. This is
-    // the critical fix. While the console is in canonical + ISIG mode, the
-    // line discipline eats backspace, Ctrl-C, Ctrl-Z, Ctrl-\ etc. before
-    // init's read() sees them. With the console in raw mode the bytes pass
-    // through untouched to the PTY master, and the slave's line discipline
-    // (which has ISIG/ICANON set) generates the correct signals and line
-    // editing for the shell.
-    //
-    // Do NOT call tcsetattr() on master_fd: termios on the master side of
-    // a PTY does not affect the slave's line discipline.
-    //
-    // Keep the master blocking; write_all()/read_chunk() handle EINTR and
-    // EAGAIN, and select() gates each transfer. This avoids losing input
-    // during fast typing or paste.
+    // Parent: put the real console into raw mode before bridging. Do not
+    // call tcsetattr() on master_fd: termios on the master side of a PTY
+    // does not affect the slave's line discipline. Keep the master
+    // blocking; write_all() and read_chunk() handle EINTR and EAGAIN, and
+    // select() gates each transfer. This avoids losing input during fast
+    // typing or paste.
     console_enter_raw();
 
     fd_set read_fds;
@@ -626,7 +706,32 @@ void setup_filesystems(void) {
 #endif
 }
 
-int main() {
+// PID 1 must never call exit() or return from main(), because the kernel
+// panics with "Attempted to kill init!" if PID 1 terminates. So instead of
+// exiting on exec failure we walk a fallback chain:
+//   1. TARGET_PROGRAM, the intended init
+//   2. /system/bin/sh -i, an interactive shell for manual repair
+//   3. an endless sleep loop that keeps PID 1 alive no matter what
+// execl() only returns on failure, so each failure simply falls through
+// to the next attempt.
+static void run_pid1_forever(void) {
+    for (;;) {
+        // First choice: the intended target init program.
+        execl(TARGET_PROGRAM, TARGET_PROGRAM, NULL);
+        fprintf(stderr, LOG_PREFIX "Failed to exec %s: %s\n", TARGET_PROGRAM, strerror(errno));
+
+        // Second choice: an interactive shell so the system can be
+        // repaired by hand instead of panicking.
+        execl("/system/bin/sh", "sh", "-i", NULL);
+        fprintf(stderr, LOG_PREFIX "Failed to exec /system/bin/sh: %s\n", strerror(errno));
+
+        // Last resort: keep PID 1 alive no matter what.
+        fprintf(stderr, LOG_PREFIX "All exec attempts failed, keeping PID 1 alive\n");
+        sleep(5);
+    }
+}
+
+int main(void) {
     signal(SIGTERM, SIG_IGN);
     signal(SIGINT, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
@@ -644,10 +749,9 @@ int main() {
 
     if (pid == 0) {
         handle_logic();
+        _exit(0);
     } else {
-        execl(TARGET_PROGRAM, TARGET_PROGRAM, NULL);
-        perror(LOG_PREFIX "execl failed");
-        exit(1);
+        run_pid1_forever();
     }
 
     return 0;
