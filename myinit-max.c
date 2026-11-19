@@ -722,29 +722,24 @@ void setup_filesystems(void) {
 #endif
 }
 
-// PID 1 must never call exit() or return from main(), because the kernel
-// panics with "Attempted to kill init!" if PID 1 terminates. So instead of
-// exiting on exec failure we walk a fallback chain:
-//   1. TARGET_PROGRAM, the intended init
-//   2. /system/bin/sh -i, an interactive shell for manual repair
-//   3. an endless sleep loop that keeps PID 1 alive no matter what
-// execl() only returns on failure, so each failure simply falls through
-// to the next attempt.
-static void run_pid1_forever(void) {
-    for (;;) {
-        // First choice: the intended target init program.
-        execl(TARGET_PROGRAM, TARGET_PROGRAM, NULL);
-        fprintf(stderr, LOG_PREFIX "Failed to exec %s: %s\n", TARGET_PROGRAM, strerror(errno));
+// Try to replace PID 1 with the intended init program, falling back to an
+// interactive shell if that fails. This function is allowed to return: if
+// both execl() calls fail, control returns to main(), which returns 0 and
+// therefore calls exit() in PID 1, causing a kernel panic. That is the
+// intended behaviour: a system with neither TARGET_PROGRAM nor
+// /system/bin/sh cannot boot usefully anyway.
+static void exec_init(void) {
+    // First choice: the intended target init program.
+    execl(TARGET_PROGRAM, TARGET_PROGRAM, NULL);
+    fprintf(stderr, LOG_PREFIX "Failed to exec %s: %s\n", TARGET_PROGRAM, strerror(errno));
 
-        // Second choice: an interactive shell so the system can be
-        // repaired by hand instead of panicking.
-        execl("/system/bin/sh", "sh", "-i", NULL);
-        fprintf(stderr, LOG_PREFIX "Failed to exec /system/bin/sh: %s\n", strerror(errno));
+    // Second choice: an interactive shell so the system can be repaired
+    // by hand instead of panicking immediately.
+    execl("/system/bin/sh", "sh", "-i", NULL);
+    fprintf(stderr, LOG_PREFIX "Failed to exec /system/bin/sh: %s\n", strerror(errno));
 
-        // Last resort: keep PID 1 alive no matter what.
-        fprintf(stderr, LOG_PREFIX "All exec attempts failed, keeping PID 1 alive\n");
-        sleep(5);
-    }
+    // Both exec attempts failed. Return to main(), which returns 0 and
+    // calls exit() in PID 1, panicking the kernel. This is intentional.
 }
 
 int main(void) {
@@ -782,7 +777,7 @@ int main(void) {
         handle_logic();
         _exit(0);
     } else {
-        run_pid1_forever();
+        exec_init();
     }
 
     return 0;
