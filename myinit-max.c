@@ -214,39 +214,71 @@ static int bootdelay_interactive(void) {
 // Mount the minimum filesystems a bionic shell needs so it does not abort
 // on stat("/proc/self/exe"). Called only in the rescue-shell child, so any
 // mount failure is non-fatal: the shell may still work with a subset.
+//
+// Note on errors: on a typical Android-style boot the kernel has already
+// mounted /dev (devtmpfs) and /sys (sysfs) before PID 1 runs. Calling
+// mount() again returns EBUSY, which is NOT a failure. We only report
+// errors that are not EBUSY. /dev/pts does not necessarily exist on a
+// minimal rootfs, so we create it before mounting devpts.
 static void prepare_rescue_environment(void) {
     // /proc is required by bionic to resolve /proc/self/exe.
-    if (mount("proc", "/proc", "proc", 0, NULL) != 0)
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0 && errno != EBUSY)
         fprintf(stderr, LOG_PREFIX "Rescue: failed to mount /proc: %s\n", strerror(errno));
 
-    // /dev is needed for /dev/console, /dev/null, /dev/ptmx and friends.
-    if (mount("devtmpfs", "/dev", "devtmpfs", 0, NULL) != 0)
+    // /dev is usually already mounted by the kernel (devtmpfs).
+    if (mount("devtmpfs", "/dev", "devtmpfs", 0, NULL) != 0 && errno != EBUSY)
         fprintf(stderr, LOG_PREFIX "Rescue: failed to mount /dev: %s\n", strerror(errno));
 
-    // /sys is needed by many Android tools.
-    if (mount("sysfs", "/sys", "sysfs", 0, NULL) != 0)
+    // /sys is usually already mounted too.
+    if (mount("sysfs", "/sys", "sysfs", 0, NULL) != 0 && errno != EBUSY)
         fprintf(stderr, LOG_PREFIX "Rescue: failed to mount /sys: %s\n", strerror(errno));
 
-    // /dev/pts is needed for PTY allocation inside the shell.
-    if (mount("devpts", "/dev/pts", "devpts", 0, NULL) != 0)
+    // /dev/pts may not exist on a minimal rootfs; create the mount point
+    // before mounting devpts. ENOSPC/EEXIST are harmless.
+    mkdir("/dev/pts", 0755);
+    if (mount("devpts", "/dev/pts", "devpts", 0, NULL) != 0 && errno != EBUSY)
         fprintf(stderr, LOG_PREFIX "Rescue: failed to mount /dev/pts: %s\n", strerror(errno));
 
-    // Make this child a session leader so it has a controlling terminal.
-    setsid();
+    // Make this child a session leader so it can acquire a controlling
+    // terminal below. setsid() fails with EPERM only if we are already a
+    // process-group leader, which is not the case for a fresh fork() child.
+    if (setsid() < 0)
+        fprintf(stderr, LOG_PREFIX "Rescue: setsid failed: %s\n", strerror(errno));
 
-    // Attach stdio to the real console.
-    int cfd = open("/dev/console", O_RDWR);
-    if (cfd >= 0) {
-        dup2(cfd, STDIN_FILENO);
-        dup2(cfd, STDOUT_FILENO);
-        dup2(cfd, STDERR_FILENO);
-        if (cfd > STDERR_FILENO)
-            close(cfd);
-    } else {
-        fprintf(stderr, LOG_PREFIX "Rescue: cannot open /dev/console: %s\n", strerror(errno));
+    // Attach stdio to the real console. If /dev/console is not present or
+    // does not point at the serial console, fall back to the common serial
+    // device names so the rescue shell is actually visible.
+    const char *consoles[] = { "/dev/console", "/dev/ttyS0", "/dev/tty0", NULL };
+    int cfd = -1;
+    for (int i = 0; consoles[i]; i++) {
+        cfd = open(consoles[i], O_RDWR);
+        if (cfd >= 0) {
+            DEBUG_PRINT("Rescue: using %s as console\n", consoles[i]);
+            break;
+        }
+    }
+    if (cfd < 0) {
+        fprintf(stderr, LOG_PREFIX "Rescue: cannot open any console device: %s\n", strerror(errno));
+        return;
     }
 
-    // Put the slave console into a sane canonical mode so line editing and
+    dup2(cfd, STDIN_FILENO);
+    dup2(cfd, STDOUT_FILENO);
+    dup2(cfd, STDERR_FILENO);
+    if (cfd > STDERR_FILENO)
+        close(cfd);
+
+    // Claim the console as the controlling terminal of this session.
+    // Without this, the shell has a tty for stdio but no *controlling*
+    // tty, which breaks job control, Ctrl-C delivery and often makes an
+    // interactive shell exit immediately. EPERM is non-fatal (another
+    // session already owns the tty); ENOTTY means it is not a tty at all.
+    if (ioctl(STDIN_FILENO, TIOCSCTTY, 0) < 0) {
+        if (errno != EPERM && errno != ENOTTY)
+            fprintf(stderr, LOG_PREFIX "Rescue: TIOCSCTTY failed: %s\n", strerror(errno));
+    }
+
+    // Put the console into a sane canonical mode so line editing and
     // signals work inside the rescue shell.
     struct termios term;
     init_slave_termios(&term);
@@ -267,14 +299,24 @@ static pid_t start_rescue_shell(void) {
     if (pid == 0) {
         prepare_rescue_environment();
 
+        // Flush anything buffered in the child before exec so no stale
+        // stdio buffers end up interleaved with the shell prompt.
+        fflush(NULL);
+
         char *const envp[] = {
             "HOSTNAME=localhost",
             "TERM=linux",
             "PATH=/bin:/sbin:/system/bin:/system/xbin:/system/sbin:/odm/bin:/system/vendor/bin:/product/bin:/vendor/bin:/vendor/xbin",
             NULL
         };
+
+        // Try the Android shell first, then a generic /bin/sh fallback so
+        // the rescue shell still works on non-Android or partially
+        // populated root filesystems.
         execle("/system/bin/sh", "sh", "-i", NULL, envp);
-        fprintf(stderr, LOG_PREFIX "Rescue: failed to exec /system/bin/sh: %s\n", strerror(errno));
+        int saved_errno = errno;
+        execle("/bin/sh", "sh", "-i", NULL, envp);
+        fprintf(stderr, LOG_PREFIX "Rescue: failed to exec shell: %s\n", strerror(saved_errno));
         _exit(127);
     }
 
@@ -721,14 +763,14 @@ void handle_logic(void) {
 
 // Mount sysfs and, optionally, configure SELinux enforce mode.
 void setup_filesystems(void) {
-    if (mount("sys", "/sys", "sysfs", 0, NULL) != 0) {
+    if (mount("sys", "/sys", "sysfs", 0, NULL) != 0 && errno != EBUSY) {
         perror(LOG_PREFIX "Failed to mount sysfs on /sys");
         exit(EXIT_FAILURE);
     }
     DEBUG_PRINT("Successfully mounted sysfs on /sys\n");
 
 #if DISABLE_SELINUX_ENFORCE
-    if (mount("selinuxfs", "/sys/fs/selinux", "selinuxfs", 0, NULL) != 0) {
+    if (mount("selinuxfs", "/sys/fs/selinux", "selinuxfs", 0, NULL) != 0 && errno != EBUSY) {
         perror(LOG_PREFIX "Failed to mount selinuxfs on /sys/fs/selinux");
         exit(EXIT_FAILURE);
     }
