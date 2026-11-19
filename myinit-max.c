@@ -33,6 +33,14 @@
 static struct termios g_saved_console_termios;
 static int g_console_raw = 0;
 
+// Set by the SIGCHLD handler so PID 1 never sleeps through a child exit.
+static volatile sig_atomic_t g_child_exited = 0;
+
+static void on_sigchld(int sig) {
+    (void)sig;
+    g_child_exited = 1;
+}
+
 // Put the real console into raw mode. While the console is in canonical
 // and ISIG mode, the line discipline consumes backspace, Ctrl-C, Ctrl-Z,
 // Ctrl-\ and friends before init's read() ever sees them. Switching the
@@ -123,15 +131,23 @@ static ssize_t read_chunk(int fd, char *buf, size_t len) {
     }
 }
 
-// Fill a termios structure with sane defaults for the slave side of the
-// interactive PTY: canonical mode, echo, signals and correct control
-// characters. This is what the shell inside the PTY sees, so it must have
-// ICANON, ECHO, ISIG and a valid VERASE for backspace to work.
+// Configure the console/PTY for interactive use WITHOUT changing the baud
+// rate. On a real serial console (ttyS0 at 115200) writing B9600 would
+// reconfigure the UART to 9600 and the user's terminal, still at 115200,
+// would then see garbage or nothing at all. The PTY slave path does not
+// care about baud, so preserving the existing c_cflag is always safe.
 static void init_slave_termios(struct termios *term) {
-    memset(term, 0, sizeof(*term));
+    struct termios cur;
+
+    if (tcgetattr(STDIN_FILENO, &cur) == 0) {
+        *term = cur;                      // keep current baud / c_cflag
+    } else {
+        memset(term, 0, sizeof(*term));
+        term->c_cflag = CREAD | CS8 | B9600;
+    }
+
     term->c_iflag = ICRNL | BRKINT;
     term->c_oflag = OPOST | ONLCR;
-    term->c_cflag = CREAD | CS8 | B9600;
     term->c_lflag = ICANON | ECHO | ECHOE | ECHOK | ISIG | IEXTEN;
 
     term->c_cc[VINTR]    = 3;   // Ctrl-C
@@ -234,7 +250,7 @@ static void prepare_rescue_environment(void) {
         fprintf(stderr, LOG_PREFIX "Rescue: failed to mount /sys: %s\n", strerror(errno));
 
     // /dev/pts may not exist on a minimal rootfs; create the mount point
-    // before mounting devpts. ENOSPC/EEXIST are harmless.
+    // before mounting devpts. EEXIST is harmless.
     mkdir("/dev/pts", 0755);
     if (mount("devpts", "/dev/pts", "devpts", 0, NULL) != 0 && errno != EBUSY)
         fprintf(stderr, LOG_PREFIX "Rescue: failed to mount /dev/pts: %s\n", strerror(errno));
@@ -245,23 +261,40 @@ static void prepare_rescue_environment(void) {
     if (setsid() < 0)
         fprintf(stderr, LOG_PREFIX "Rescue: setsid failed: %s\n", strerror(errno));
 
-    // Attach stdio to the real console. If /dev/console is not present or
-    // does not point at the serial console, fall back to the common serial
-    // device names so the rescue shell is actually visible.
-    const char *consoles[] = { "/dev/console", "/dev/ttyS0", "/dev/tty0", NULL };
+    // Prefer the actual serial console over /dev/console. On many boards
+    // /dev/console is the last registered console, which is often tty0
+    // (the virtual console) rather than the serial UART the user is
+    // actually watching. Writing to tty0 means "no output, no input" —
+    // which is exactly what a hang looks like from the user's side.
+    const char *consoles[] = {
+        "/dev/ttyS0", "/dev/ttyS1", "/dev/ttyS2",
+        "/dev/ttyAMA0", "/dev/ttyO0",
+        "/dev/console", "/dev/tty0",
+        NULL
+    };
     int cfd = -1;
+    const char *chosen = NULL;
     for (int i = 0; consoles[i]; i++) {
-        cfd = open(consoles[i], O_RDWR);
-        if (cfd >= 0) {
-            DEBUG_PRINT("Rescue: using %s as console\n", consoles[i]);
-            break;
+        int fd = open(consoles[i], O_RDWR | O_NOCTTY);
+        if (fd < 0)
+            continue;
+        if (!isatty(fd)) {
+            close(fd);
+            continue;
         }
+        cfd = fd;
+        chosen = consoles[i];
+        break;
     }
     if (cfd < 0) {
         fprintf(stderr, LOG_PREFIX "Rescue: cannot open any console device: %s\n", strerror(errno));
         return;
     }
+    DEBUG_PRINT("Rescue: using %s as console\n", chosen);
 
+    // O_NOCTTY above prevented the open() itself from acquiring the tty
+    // as the controlling terminal; do that deliberately with TIOCSCTTY
+    // AFTER stdio is set up so the shell ends up in the foreground pgrp.
     dup2(cfd, STDIN_FILENO);
     dup2(cfd, STDOUT_FILENO);
     dup2(cfd, STDERR_FILENO);
@@ -278,11 +311,19 @@ static void prepare_rescue_environment(void) {
             fprintf(stderr, LOG_PREFIX "Rescue: TIOCSCTTY failed: %s\n", strerror(errno));
     }
 
-    // Put the console into a sane canonical mode so line editing and
-    // signals work inside the rescue shell.
+    // Put the console into a sane canonical mode. init_slave_termios()
+    // preserves the current baud rate, so a real 115200 serial console
+    // stays at 115200 and the user's terminal keeps showing output.
     struct termios term;
     init_slave_termios(&term);
     tcsetattr(STDIN_FILENO, TCSANOW, &term);
+
+    // Prove the console fd is writable before handing the shell to it.
+    // If this string never reaches the user, the console fd is the wrong
+    // device (tty0 vs ttyS0) — not a shell problem.
+    const char *msg = "\r\nmyinit: rescue shell starting, type 'exit' to continue boot\r\n";
+    if (write(STDOUT_FILENO, msg, strlen(msg)) < 0)
+        fprintf(stderr, LOG_PREFIX "Rescue: write to console failed: %s\n", strerror(errno));
 }
 
 // Start an interactive rescue shell in a child process. PID 1 stays alive
@@ -663,9 +704,8 @@ void handle_logic(void) {
 
     // Build an explicit termios for the slave side of the PTY. Passing
     // NULL to forkpty() would leave the slave with the inherited termios,
-    // which may lack ICANON, ECHO, ISIG and VERASE. We want a fully
-    // configured slave so the shell inside the PTY gets proper line
-    // editing and signal generation.
+    // which may lack ICANON, ECHO, ISIG and VERASE. init_slave_termios()
+    // preserves the current baud, so a real serial console keeps 115200.
     struct termios slave_term;
     init_slave_termios(&slave_term);
 
@@ -820,11 +860,40 @@ static void exec_init(void) {
     // calls exit() in PID 1, panicking the kernel. This is intentional.
 }
 
+// Wait for a specific child, but never block forever if a signal arrives
+// and waitpid() returns EINTR. The SIGCHLD handler sets g_child_exited so
+// the loop can break out even if waitpid() is restarted.
+static int wait_for_child(pid_t child) {
+    int status = 0;
+    g_child_exited = 0;
+    for (;;) {
+        pid_t r = waitpid(child, &status, 0);
+        if (r == child)
+            break;
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (g_child_exited)
+            break;
+    }
+    return status;
+}
+
 int main(void) {
     signal(SIGTERM, SIG_IGN);
     signal(SIGINT, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
     signal(SIGHUP, SIG_IGN);
+
+    // Install the SIGCHLD handler *before* forking anything, so PID 1
+    // never sleeps through a child exit.
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigchld;
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
 
     setup_filesystems();
 
@@ -845,8 +914,7 @@ int main(void) {
 
         pid_t shell_pid = start_rescue_shell();
         if (shell_pid > 0) {
-            int status;
-            waitpid(shell_pid, &status, 0);
+            int status = wait_for_child(shell_pid);
             if (WIFEXITED(status)) {
                 fprintf(stderr, LOG_PREFIX "Rescue shell exited with status %d, continuing boot\n", WEXITSTATUS(status));
             } else if (WIFSIGNALED(status)) {
